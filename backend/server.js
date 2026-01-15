@@ -7,6 +7,7 @@ const cors=require("cors");
 const db=require('./config/db');
 
 const userRoute=require('./routers/userRouter');
+const productRoute=require('./routers/productRouter');
 
 app.use(express.json());
 app.use(cors());
@@ -16,6 +17,7 @@ app.use((req,res,next)=>{
 });
 
 app.use("/user",userRoute);
+app.use("/product",productRoute)
 
 app.listen(PORT,()=>{
     console.log(`server is running on ${PORT}`);
