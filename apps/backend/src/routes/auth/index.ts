@@ -1,0 +1,278 @@
+import { User, UserStatus } from '@prisma/client'
+import { mdUserAdd, mdUserFindEmail, mdUserUpdate } from '@database'
+import { validateRegisterUser } from '@namviek/core/validation'
+import { Router } from 'express'
+import {
+  decodeToken,
+  generateVerifyToken
+} from '../../lib/jwt'
+import { hashPassword } from '../../lib/password'
+import { AuthRequest, JWTPayload } from '../../types'
+import JwtProvider from '../../providers/JwtProvider'
+import EmailAuthProvider from '../../providers/auth/EmailAuthProvider'
+import CredentialInvalidException from '../../exceptions/CredentialInvalidException'
+import GoogleAuthProvider from '../../providers/auth/GoogleAuthProvider'
+import { isDevMode, isEmailVerificationEnabled } from '../../lib/utils'
+import { sendDiscordLog } from '../../lib/log'
+import { authMiddleware } from '../../middlewares'
+
+const mainRouter = Router()
+const router = Router()
+
+mainRouter.use('/auth', router)
+
+router.post('/refresh-token', async (req, res) => {
+  console.log('a')
+})
+
+router.post('/sign-in', async (req, res) => {
+  try {
+    const body = req.body as Pick<User, 'email' | 'password'> & {
+      provider: 'GOOGLE' | 'EMAIL_PASSWORD'
+    }
+
+    const isEmailPasswordProvider = body.provider === 'EMAIL_PASSWORD'
+    const isGoogleProvider = body.provider === 'GOOGLE'
+
+    let authProvider: EmailAuthProvider | GoogleAuthProvider
+
+    if (isEmailPasswordProvider) {
+      authProvider = new EmailAuthProvider({
+        email: body.email,
+        password: body.password
+      })
+    }
+
+    if (isGoogleProvider) {
+      authProvider = new GoogleAuthProvider({
+        email: body.email,
+        password: body.password
+      })
+    }
+
+    if (!authProvider) {
+      throw new CredentialInvalidException()
+    }
+
+    await authProvider.verify()
+    const user = authProvider.getUser()
+
+    const jwtProvider = new JwtProvider({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      photo: user.photo
+    })
+
+    sendDiscordLog(`${user.email} - ${user.name} just signed in`)
+
+    const { token, refreshToken } = jwtProvider.generate()
+
+    res.setHeader('Authorization', token)
+    res.setHeader('RefreshToken', refreshToken)
+
+    res.json({ status: 200, data: user })
+  } catch (error) {
+    res.json({ status: error.status, error })
+  }
+})
+
+router.post('/sign-up-private', [authMiddleware], async (req: AuthRequest, res) => {
+  try {
+    const body = req.body as User
+    const { id: uid } = req.authen
+    const { error, errorArr, data } = validateRegisterUser(body)
+
+    if (error && errorArr) {
+      return res.json({ status: 404, error: errorArr })
+    }
+
+    const resultData = data as User
+    const hashedPwd = hashPassword(resultData.password)
+    const userStatus = body.status
+
+    const insertedData = {
+      email: resultData.email,
+      password: hashedPwd,
+      name: resultData.name,
+      country: null,
+      bio: null,
+      dob: null,
+      status: userStatus,
+      photo: null,
+      settings: {},
+      createdAt: new Date(),
+      createdBy: uid,
+      resetToken: null,
+      updatedAt: null,
+      updatedBy: null
+    }
+
+    const user = await mdUserAdd(insertedData)
+
+    res.json({
+      status: 200,
+      data: user
+    })
+  } catch (error) {
+    let errorMessage = 'Internal Server Error'
+    if (error && error.code === 'P2002') {
+      errorMessage = 'Duplicate Email'
+    }
+    res.json({
+      status: 500,
+      error: errorMessage
+    })
+  }
+})
+
+router.post('/sign-up', async (req, res) => {
+  try {
+    const body = req.body as User
+    const { error, errorArr, data } = validateRegisterUser(body)
+
+    if (error && errorArr) {
+      return res.json({ status: 404, error: errorArr })
+    }
+
+    const resultData = data as User
+    const hashedPwd = hashPassword(resultData.password)
+
+    const user = await mdUserAdd({
+      email: resultData.email,
+      password: hashedPwd,
+      resetToken: null,
+      name: resultData.name,
+      country: null,
+      bio: null,
+      dob: null,
+      status: isDevMode()
+        ? UserStatus.ACTIVE
+        : isEmailVerificationEnabled()
+        ? UserStatus.INACTIVE
+        : UserStatus.ACTIVE,
+      photo: null,
+      settings: {},
+      createdAt: new Date(),
+      createdBy: null,
+      updatedAt: null,
+      updatedBy: null
+    })
+
+    const token = generateVerifyToken({
+      email: resultData.email,
+      name: resultData.name
+    })
+
+    // ✅ Nodemailer directly here
+    const nodemailer = require('nodemailer')
+
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    })
+
+const verifyUrl = `${process.env.NEXT_PUBLIC_FE_GATEWAY}/verify?token=${token}`
+    await transporter.sendMail({
+      from: `"${process.env.APP_NAME}" <${process.env.EMAIL_USER}>`,
+      to: resultData.email,
+      subject: `[${process.env.APP_NAME}] Verify your email`,
+      html: `
+        <h2>Hello ${resultData.name}</h2>
+        <p>Please verify your account:</p>
+        <a href="${verifyUrl}">Verify Email</a>
+        <p>${verifyUrl}</p>
+      `
+    })
+
+    user.password = null
+    res.json({
+      status: 200,
+      data: user
+    })
+  } catch (error) {
+    res.json({
+      status: 500,
+      error
+    })
+  }
+})
+
+router.get('/verify', async (req, res) => {
+  const { token } = req.query as { token: string }
+  try {
+    const { email } = decodeToken(token) as JWTPayload
+    const user = await mdUserFindEmail(email)
+    if (!user) {
+      return res.json({ status: 400, error: 'Your credential is invalid' })
+    }
+
+    if (user.status === UserStatus.ACTIVE) {
+      res.json({
+        status: 200,
+        message: 'Your account has already been activated'
+      })
+    } else {
+      await mdUserUpdate(user.id, { status: UserStatus.ACTIVE })
+      res.json({
+        status: 200,
+        message: 'Congratulations! Your Account is Now Active.'
+      })
+    }
+  } catch (error) {
+    res.status(500).send(error)
+  }
+})
+
+router.post('/resend-verify-email', async (req, res) => {
+  try {
+    const { email } = req.body
+
+    const user = await mdUserFindEmail(email)
+    if (!user) {
+      return res.json({ status: 400, error: 'Your credential is invalid' })
+    }
+
+    const token = generateVerifyToken({
+      email: email,
+      name: user.name
+    })
+
+    // ✅ Nodemailer here also
+    const nodemailer = require('nodemailer')
+
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    })
+
+    const verifyUrl = `${process.env.FE_GATEWAY}/verify?token=${token}`
+
+    await transporter.sendMail({
+      from: `"${process.env.APP_NAME}" <${process.env.EMAIL_USER}>`,
+      to: email,
+      subject: `[${process.env.APP_NAME}] Verify your email`,
+      html: `
+        <h2>Hello ${user.name}</h2>
+        <p>Please verify your account:</p>
+        <a href="${verifyUrl}">Verify Email</a>
+        <p>${verifyUrl}</p>
+      `
+    })
+
+    res.json({ status: 200, data: user })
+  } catch (error) {
+    res.json({
+      status: 500,
+      error
+    })
+  }
+})
+
+export default mainRouter
